@@ -101,16 +101,26 @@ namespace ICSharpCode.Decompiler.ILAst
 				return false;
 			ILExpression newObj;
 			if (method.Body.Count == 1) {
-				// ret(newobj(...))
-				if (method.Body[0].Match(ILCode.Ret, out newObj))
-					return MatchEnumeratorCreationNewObj(newObj, out enumeratorCtor);
-				else
-					return false;
-			}
+                // ret(newobj(...))
+                if (method.Body[0].Match(ILCode.Ret, out newObj))
+                    return MatchEnumeratorCreationNewObj(newObj, out enumeratorCtor);
+                else
+                    return false;
+            }
+            // newobj('<Load>c__Iterator7'::.ctor)
+            if (method.Body[0].Match(ILCode.Newobj, out newObj))
+            {
+                Console.WriteLine("[YLD] NOTICE " + method.Body[0].ToString() + "");
+                return MatchEnumeratorCreationNewObj(newObj, out enumeratorCtor);
+            }
+
 			// stloc(var_1, newobj(..)
+            // stloc(var_0_05, newobj('<Load>c__Iterator7'::.ctor))
 			ILVariable var1;
 			if (!method.Body[0].Match(ILCode.Stloc, out var1, out newObj))
 				return false;
+            else
+                Console.WriteLine("[YLD] NOTICE " + newObj.ToString() + " detected as possible yeild");
 			if (!MatchEnumeratorCreationNewObj(newObj, out enumeratorCtor))
 				return false;
 			
@@ -164,16 +174,39 @@ namespace ICSharpCode.Decompiler.ILAst
 		{
 			// newobj(CurrentType/...::.ctor, ldc.i4(-2))
 			ctor = null;
-			if (expr.Code != ILCode.Newobj || expr.Arguments.Count != 1)
-				return false;
-			if (expr.Arguments[0].Code != ILCode.Ldc_I4)
-				return false;
-			int initialState = (int)expr.Arguments[0].Operand;
-			if (!(initialState == -2 || initialState == 0))
-				return false;
+			// N3X15 WAS: if (expr.Code != ILCode.Newobj || expr.Arguments.Count != 1)
+            if (expr.Code != ILCode.Newobj)
+            {
+                Console.WriteLine("[YLD] REJECTED " + expr.ToString() + " BECAUSE "+expr.Code.GetName()+"!=ILCode.Newobj");
+                return false;
+            }
+            if(expr.Arguments.Count > 1)
+            {
+                Console.WriteLine("[YLD] REJECTED " + expr.ToString() + " BECAUSE " + expr.Arguments.Count + ">1");
+                return false;
+            }
+            // N3X15: Handle stuff like newobj('<Load>c__Iterator7'::.ctor)
+            if (expr.Arguments.Count==0 || expr.Arguments[0].Code != ILCode.Ldc_I4)
+            {
+                //return false;
+                Console.WriteLine("[YLD] WARNING " + expr.ToString() + ": LDC_I4 not present");
+            }
+            else
+            {
+                int initialState = (int)expr.Arguments[0].Operand;
+                if (!(initialState == -2 || initialState == 0))
+                {
+                    Console.WriteLine("[YLD] REJECTED " + expr.ToString() + " BECAUSE " + initialState + "!= (-2 | 0)");
+                    return false;
+                }
+            }
+            // End N3X15
 			ctor = GetMethodDefinition(expr.Operand as MethodReference);
-			if (ctor == null || ctor.DeclaringType.DeclaringType != context.CurrentType)
-				return false;
+            if (ctor == null || ctor.DeclaringType.DeclaringType != context.CurrentType)
+            {
+                Console.WriteLine("[YLD] REJECT " + expr.ToString() + ": ctor null or not in context");
+                return false;
+            }
 			return IsCompilerGeneratorEnumerator(ctor.DeclaringType);
 		}
 		
@@ -196,20 +229,36 @@ namespace ICSharpCode.Decompiler.ILAst
 		void AnalyzeCtor()
 		{
 			ILBlock method = CreateILAst(enumeratorCtor);
-			
-			foreach (ILNode node in method.Body) {
-				FieldReference field;
-				ILExpression instExpr;
-				ILExpression stExpr;
-				ILVariable arg;
-				if (node.Match(ILCode.Stfld, out field, out instExpr, out stExpr) &&
-				    instExpr.MatchThis() &&
-				    stExpr.Match(ILCode.Ldloc, out arg) &&
-				    arg.IsParameter && arg.OriginalParameter.Index == 0)
-				{
-					stateField = GetFieldDefinition(field);
-				}
-			}
+
+            //call(object::.ctor, ldloc(this))
+            // this(this)? idfk
+            ILExpression redir;
+            for (int i = 0;i<method.Body.Count;i++)
+            {
+                Console.WriteLine("[YLD] .ctor field["+i+"]: " + method.Body[0].ToString());
+            }
+            if (method.Body[0].Match(ILCode.Call))
+            {
+                // find $PC, .ctor is empty.
+                stateField=enumeratorType.Fields.FirstOrDefault(f => f.Name.Equals("$PC"));
+            }
+            else
+            {
+                foreach (ILNode node in method.Body)
+                {
+                    FieldReference field;
+                    ILExpression instExpr;
+                    ILExpression stExpr;
+                    ILVariable arg;
+                    if (node.Match(ILCode.Stfld, out field, out instExpr, out stExpr) &&
+                        instExpr.MatchThis() &&
+                        stExpr.Match(ILCode.Ldloc, out arg) &&
+                        arg.IsParameter && arg.OriginalParameter.Index == 0)
+                    {
+                        stateField = GetFieldDefinition(field);
+                    }
+                }
+            }
 			if (stateField == null)
 				throw new YieldAnalysisFailedException();
 		}
@@ -319,7 +368,7 @@ namespace ICSharpCode.Decompiler.ILAst
 		
 		void ConstructExceptionTable()
 		{
-			disposeMethod = enumeratorType.Methods.FirstOrDefault(m => m.Name == "System.IDisposable.Dispose");
+			disposeMethod = enumeratorType.Methods.FirstOrDefault(m => m.Name.EndsWith("Dispose"));
 			ILBlock ilMethod = CreateILAst(disposeMethod);
 			
 			finallyMethodToStateInterval = new Dictionary<MethodDefinition, Interval>();
@@ -334,8 +383,9 @@ namespace ICSharpCode.Decompiler.ILAst
 				if (finallyBody.Count != 2)
 					throw new YieldAnalysisFailedException();
 				ILExpression call = finallyBody[0] as ILExpression;
-				if (call == null || call.Code != ILCode.Call || call.Arguments.Count != 1)
+				if (call == null || !(call.Code == ILCode.Call || call.Code == ILCode.Callvirt) || call.Arguments.Count != 1)
 					throw new YieldAnalysisFailedException();
+                if(call.Code==ILCode.Call)
 				if (!call.Arguments[0].MatchThis())
 					throw new YieldAnalysisFailedException();
 				if (!finallyBody[1].Match(ILCode.Endfinally))
@@ -529,6 +579,7 @@ namespace ICSharpCode.Decompiler.ILAst
 							}
 							break;
 						}
+                    case ILCode.Stfld:
 					case ILCode.Nop:
 						ranges[body[i + 1]].UnionWith(nodeRange);
 						break;
@@ -539,8 +590,8 @@ namespace ICSharpCode.Decompiler.ILAst
 							SymbolicValue val = Eval(expr.Arguments[0]);
 							if (val.Type == SymbolicValueType.State && val.Constant == 0 && rangeAnalysisStateVariable == null)
 								rangeAnalysisStateVariable = (ILVariable)expr.Operand;
-							else
-								throw new YieldAnalysisFailedException();
+                            //else
+                            //    throw new YieldAnalysisFailedException();
 							goto case ILCode.Nop;
 						}
 					case ILCode.Call:
@@ -555,10 +606,13 @@ namespace ICSharpCode.Decompiler.ILAst
 						}
 						break;
 					default:
-						if (forDispose)
-							throw new YieldAnalysisFailedException();
-						else
-							return i;
+                        if (forDispose)
+                        {
+                            Console.WriteLine("[YLD] FAIL " + expr.ToString());
+                            throw new YieldAnalysisFailedException();
+                        }
+                        else
+                            return i;
 				}
 			}
 			return bodyLength;
@@ -684,8 +738,8 @@ namespace ICSharpCode.Decompiler.ILAst
 				returnVariable = null;
 				returnLabel = null;
 				// In this case, the last return must return false.
-				if (lastReturnArg.Code != ILCode.Ldc_I4 || (int)lastReturnArg.Operand != 0)
-					throw new YieldAnalysisFailedException();
+                //if (lastReturnArg.Code != ILCode.Ldc_I4 || (int)lastReturnArg.Operand != 0)
+                //    throw new YieldAnalysisFailedException();
 			}
 			
 			ILTryCatchBlock tryFaultBlock = ilMethod.Body[0] as ILTryCatchBlock;
